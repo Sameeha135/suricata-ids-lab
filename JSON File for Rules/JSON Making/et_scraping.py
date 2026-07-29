@@ -2,19 +2,35 @@ import os
 import time
 import json
 import re
+import logging
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 # --- Configuration ---
 MAP_FILE = "sid-msg.map"
 OUTPUT_FILE = "suricata_et_rules.json"
-CHECKPOINT_FILE = "et_checkpoint.json"
+CHECKPOINT_FILE = "et_checkpoint.json" 
 
 # Set TEST_LIMIT to None to process all rules in the map file.
-TEST_LIMIT = 10
+TEST_LIMIT = None
 
 # Rate limit delay in seconds between requests
-REQUEST_DELAY = 2
+REQUEST_DELAY = 1.5
+
+# Logging 
+LOG_FILE = "scraping_log.txt"
+FAILED_SIDS_FILE = "failed_sids.json"
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8"
+)
+# Also print to console so you can watch live, in addition to the log file
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger().addHandler(console)
 
 
 def load_sids_from_map(file_path):
@@ -298,81 +314,111 @@ def main():
     all_rules = load_sids_from_map(MAP_FILE)
 
     if TEST_LIMIT:
-        print(f"[!] TEST MODE ACTIVE: Limiting processing to first {TEST_LIMIT} rules.")
+        logging.info(f"TEST MODE ACTIVE: Limiting processing to first {TEST_LIMIT} rules.")
         all_rules = all_rules[:TEST_LIMIT]
     else:
-        print(f"[+] FULL RUN MODE ACTIVE: Processing all {len(all_rules)} rules.")
+        logging.info(f"FULL RUN MODE ACTIVE: Processing all {len(all_rules)} rules.")
 
     results = {}
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
             results = json.load(f)
-        print(f"[+] Resuming from checkpoint: {len(results)} rules already processed.")
+        logging.info(f"Resuming from checkpoint: {len(results)} rules already processed.")
+
+    failed_sids = []
+    if os.path.exists(FAILED_SIDS_FILE):
+        with open(FAILED_SIDS_FILE, "r", encoding="utf-8") as f:
+            failed_sids = json.load(f)
 
     total = len(all_rules)
     processed_count = 0
+    browser = None
 
-    print("[+] Launching headless browser...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720}
-        )
-        page = context.new_page()
+    def save_progress():
+        """Called from checkpoints AND from the finally block, so progress
+        is never lost regardless of how the run ends."""
+        with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(results.values()), f, indent=2, ensure_ascii=False)
+        with open(FAILED_SIDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(failed_sids, f, indent=2, ensure_ascii=False)
 
-        for idx, rule in enumerate(all_rules, start=1):
-            sid_str = str(rule["sid"])
+    logging.info("Launching headless browser...")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 720}
+            )
+            page = context.new_page()
 
-            if sid_str in results and "severity" in results[sid_str] and results[sid_str].get("protocol") is not None:
-                continue
+            for idx, rule in enumerate(all_rules, start=1):
+                sid_str = str(rule["sid"])
 
-            print(f"[{idx}/{total}] Fetching SID {sid_str} metadata and description...")
-            
-            url = f"https://threatintel.proofpoint.com/sid/{sid_str}"
+                if sid_str in results and "severity" in results[sid_str] and results[sid_str].get("protocol") is not None:
+                    continue
+
+                logging.info(f"[{idx}/{total}] Fetching SID {sid_str} metadata and description...")
+
+                url = f"https://threatintel.proofpoint.com/sid/{sid_str}"
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=20000)
+                    page.locator("button, [role='tab']").first.wait_for(timeout=5000)
+                except Exception as e:
+                    logging.warning(f"Failed to load URL for SID {sid_str}: {e}")
+                    if sid_str not in failed_sids:
+                        failed_sids.append(sid_str)
+                    continue
+
+                try:
+                    summary_meta = fetch_summary_metadata(page, rule["sid"])
+                    ruletext_meta = fetch_rule_text_metadata(page, rule["sid"])
+                    desc = fetch_description(page, rule["sid"])
+
+                    raw_scraped_data = {
+                        "sid": rule["sid"],
+                        "msg": rule["msg"],
+                        **summary_meta,
+                        **ruletext_meta,
+                        "description": desc
+                    }
+
+                    results[sid_str] = format_and_split_rule(raw_scraped_data)
+                    processed_count += 1
+
+                except Exception as e:
+                    # Catches anything unexpected in the per-SID processing itself
+                    # (not just page-load failures) so one bad record can't kill the run.
+                    logging.error(f"Unexpected error processing SID {sid_str}: {e}")
+                    if sid_str not in failed_sids:
+                        failed_sids.append(sid_str)
+                    continue
+
+                if processed_count % 25 == 0:
+                    save_progress()
+                    logging.info(f"Saved checkpoint + updated {OUTPUT_FILE} ({len(results)} processed, {len(failed_sids)} failed so far)")
+
+                time.sleep(REQUEST_DELAY)
+
+            browser.close()
+            browser = None
+
+    except KeyboardInterrupt:
+        logging.warning("Scraping interrupted by user (Ctrl+C). Saving progress before exit...")
+    except Exception as e:
+        logging.critical(f"Scraping stopped due to an unexpected error: {e}", exc_info=True)
+    finally:
+        # Runs no matter how the run ends - success, crash, or manual interrupt -
+        # so you never lose more than a few seconds of work.
+        if browser:
             try:
-                page.goto(url, wait_until="networkidle", timeout=20000)
-                # Extra explicit safety wait to ensure initial client-side routing application is completely mounted
-                page.locator("button, [role='tab']").first.wait_for(timeout=5000)
-            except Exception as e:
-                print(f"    [!] Failed to load URL for SID {sid_str}: {e}")
-                continue
-
-            # 1. Grab Summary Metadata
-            summary_meta = fetch_summary_metadata(page, rule["sid"])
-
-            # 2. Grab RuleText Metadata (including network_match string)
-            ruletext_meta = fetch_rule_text_metadata(page, rule["sid"])
-
-            # 3. Grab Description Text
-            desc = fetch_description(page, rule["sid"])
-
-            # Assembly dictionary using robust extraction paired with a map-file fallback layer for core tracking identifiers
-            raw_scraped_data = {
-                "sid": rule["sid"],
-                "msg": rule["msg"],
-                **summary_meta,
-                **ruletext_meta,
-                "description": desc
-            }
-
-            results[sid_str] = format_and_split_rule(raw_scraped_data)
-            processed_count += 1
-
-            if processed_count % 25 == 0:
-                with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-                    json.dump(results, f, indent=2, ensure_ascii=False)
-                print(f"    [--> Saved checkpoint ({len(results)} processed)]")
-
-            time.sleep(REQUEST_DELAY)
-
-        browser.close()
-
-    final_output = list(results.values())
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(final_output, f, indent=2, ensure_ascii=False)
-
-    print(f"\n[+] Processing complete! Saved {len(final_output)} records to {OUTPUT_FILE}.")
+                browser.close()
+            except Exception:
+                pass
+        save_progress()
+        logging.info(f"Final save complete. {len(results)} total records, {len(failed_sids)} failed SIDs logged to {FAILED_SIDS_FILE}.")
 
 
 if __name__ == "__main__":
