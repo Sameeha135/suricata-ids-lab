@@ -1,0 +1,2 @@
+# Ignore large generated JSON rule files
+*.json

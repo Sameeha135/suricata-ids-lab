@@ -10,7 +10,7 @@ OUTPUT_FILE = "suricata_community_sample.json"
 SURICATA_VERSION = "8.0.6"
 
 # Set TEST_LIMIT to 10 for testing per source, or None for all rules
-TEST_LIMIT = 10
+TEST_LIMIT = None
 
 RULE_REGEX = re.compile(
     r"^(?P<action>alert|drop|pass|reject|sdrop|log)\s+"

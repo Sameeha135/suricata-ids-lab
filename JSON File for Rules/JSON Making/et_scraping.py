@@ -1,25 +1,27 @@
 import os
-import time
+import asyncio
 import json
 import re
 import logging
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 # --- Configuration ---
 MAP_FILE = "sid-msg.map"
 OUTPUT_FILE = "suricata_et_rules.json"
-CHECKPOINT_FILE = "et_checkpoint.json" 
-
-# Set TEST_LIMIT to None to process all rules in the map file.
-TEST_LIMIT = None
-
-# Rate limit delay in seconds between requests
-REQUEST_DELAY = 1.5
-
-# Logging 
+CHECKPOINT_FILE = "et_checkpoint.json"
 LOG_FILE = "scraping_log.txt"
 FAILED_SIDS_FILE = "failed_sids.json"
+
+# This machine handles SIDs from START_INDEX up to (not including) END_INDEX,
+# based on position in sid-msg.map - NOT based on SID number itself. This is
+# what keeps local and Kaggle from ever double-processing the same range.
+START_INDEX = 0
+END_INDEX = 35000  # local stops here; Kaggle picks up from 35000 onward
+
+TEST_LIMIT = None  # set to a small number to smoke-test, None for full range
+REQUEST_DELAY = 0.3  # per-worker delay - lower now that we run several workers in parallel
+CONCURRENCY = 6  # number of pages scraping simultaneously - start here, raise cautiously
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -27,26 +29,21 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     encoding="utf-8"
 )
-# Also print to console so you can watch live, in addition to the log file
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 logging.getLogger().addHandler(console)
 
 
 def load_sids_from_map(file_path):
-    # Parses sid-msg.map and extracts SID and msg for every rule
     sids = []
     print(f"[+] Loading SIDs from {file_path}...")
-
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Could not find {file_path}. Place it in the script directory.")
-
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-
             parts = line.split("||")
             if len(parts) >= 2:
                 try:
@@ -55,33 +52,30 @@ def load_sids_from_map(file_path):
                     sids.append({"sid": sid, "msg": msg})
                 except ValueError:
                     continue
-
     print(f"[+] Found {len(sids)} total rules in {file_path}.")
     return sids
 
 
 def clean_value(val):
-    # Normalizes 'Not Applicable' or empty placeholders to None (null in JSON)
     if not val or val.strip() in ["Not Applicable", "N/A", "-", "Not Applicable Available"]:
         return None
     return val.strip()
 
 
-def fetch_description(page, sid):
-    # Fetches the threat research description for a given SID from threatintel.proofpoint.com by targeting the Description tab.
+async def fetch_description(page, sid):
     try:
         try:
             desc_tab = page.locator("button, [role='tab']", has_text="Description").first
-            if desc_tab.is_visible():
-                desc_tab.click(timeout=5000)
-                # Wait explicitly for either description text or the explicit empty indicator
-                page.locator("text=Description augmented by Proofpoint Nexus, text=Threat Research Generated, text=No Description Available").first.wait_for(timeout=4000)
+            if await desc_tab.is_visible():
+                await desc_tab.click(timeout=4000)
+                await page.locator(
+                    "text=Description augmented by Proofpoint Nexus, text=Threat Research Generated, text=No Description Available"
+                ).first.wait_for(timeout=3000)
         except Exception:
             pass
 
-        html = page.content()
+        html = await page.content()
         soup = BeautifulSoup(html, "html.parser")
-        
         if "No Description Available" in soup.get_text():
             return None
 
@@ -97,7 +91,6 @@ def fetch_description(page, sid):
                     parent_div = heading.find_parent("div")
                     if parent_div:
                         next_p = parent_div.find("p", class_=lambda c: c and "MuiTypography-body1" in c)
-                
                 if next_p and next_p.get_text(strip=True):
                     text_val = next_p.get_text(separator=" ", strip=True)
                     if text_val and text_val != "App Switcher" and len(text_val) > 40:
@@ -107,35 +100,30 @@ def fetch_description(page, sid):
             text = desc_element.get_text(separator=" ", strip=True)
             if text and text != "App Switcher" and "This feature requires" not in text and len(text) > 40:
                 return text
-
         return None
-
     except Exception as e:
-        print(f"    [!] Browser could not find description for SID {sid}: {e}")
+        logging.warning(f"    [!] Could not find description for SID {sid}: {e}")
         return None
 
 
-def fetch_summary_metadata(page, sid):
-    # Extracts all metadata fields using precise container/grid matching with active validation waits.
+async def fetch_summary_metadata(page, sid):
     summary_data = {}
     try:
         try:
             summary_tab = page.locator("button, [role='tab']", has_text="Summary").first
-            if summary_tab.is_visible():
-                summary_tab.click(timeout=5000)
-                # WAIT explicitly for layout container elements to load to eliminate null race conditions
-                page.locator("text=Creation Date").first.wait_for(timeout=4000)
+            if await summary_tab.is_visible():
+                await summary_tab.click(timeout=4000)
+                await page.locator("text=Creation Date").first.wait_for(timeout=3000)
         except Exception:
             pass
 
-        html = page.content()
+        html = await page.content()
         soup = BeautifulSoup(html, "html.parser")
-        
         main_content = soup.find("main", class_=lambda c: c and "MuiBox-root" in c)
-        
+
         known_fields = [
-            "Name", "Creation Date", "Last Modified", "Severity", 
-            "Affected Products", "Signature Placement", "Attack Target", 
+            "Name", "Creation Date", "Last Modified", "Severity",
+            "Affected Products", "Signature Placement", "Attack Target",
             "Category", "Malware Family", "Performance Impact", "Ruleset"
         ]
 
@@ -150,7 +138,6 @@ def fetch_summary_metadata(page, sid):
                         field_key = field.lower().replace(" ", "_")
                         summary_data[field_key] = clean_value(val)
                         continue
-
                 if main_content:
                     text_list = [e.strip() for e in main_content.find_all(string=True) if e.strip()]
                     if field in text_list:
@@ -160,41 +147,30 @@ def fetch_summary_metadata(page, sid):
                             if field_val not in known_fields:
                                 field_key = field.lower().replace(" ", "_")
                                 summary_data[field_key] = clean_value(field_val)
-
         return summary_data
     except Exception as e:
-        print(f"    [!] Error parsing summary metadata for SID {sid}: {e}")
+        logging.warning(f"    [!] Error parsing summary metadata for SID {sid}: {e}")
         return {}
 
 
-def fetch_rule_text_metadata(page, sid):
-    # Extracts rule parameters reliably from the RuleText tab using verified structural locators.
-    rule_text_data = {
-        "references": [],
-        "rule_metadata": {}
-    }
+async def fetch_rule_text_metadata(page, sid):
+    rule_text_data = {"references": [], "rule_metadata": {}}
     try:
         try:
             ruletext_tab = page.locator("button, [role='tab']", has_text="RuleText").first
-            if ruletext_tab.is_visible():
-                ruletext_tab.click(timeout=5000)
-                page.locator("text=Network Match").first.wait_for(timeout=4000)
+            if await ruletext_tab.is_visible():
+                await ruletext_tab.click(timeout=4000)
+                await page.locator("text=Network Match").first.wait_for(timeout=3000)
         except Exception:
             pass
 
-        html = page.content()
+        html = await page.content()
         soup = BeautifulSoup(html, "html.parser")
-        
-        fields_to_extract = {
-            "Action": "action",
-            "Network Match": "network_match",
-            "Flow": "flow",
-            "Flowbits": "flowbits",
-            "Classtype": "classtype",
-            "SID": "sid",
-            "REV": "rev"
-        }
 
+        fields_to_extract = {
+            "Action": "action", "Network Match": "network_match", "Flow": "flow",
+            "Flowbits": "flowbits", "Classtype": "classtype", "SID": "sid", "REV": "rev"
+        }
         for label_text, key in fields_to_extract.items():
             label_el = soup.find(string=lambda s: s and s.strip() == label_text)
             if label_el:
@@ -205,7 +181,6 @@ def fetch_rule_text_metadata(page, sid):
                         val = sibling.get_text(strip=True)
                         rule_text_data[key] = clean_value(val)
                         continue
-                
                 grandparent = label_el.find_parent(["div", "tr", "section"])
                 if grandparent:
                     text_nodes = [t.strip() for t in grandparent.stripped_strings]
@@ -214,7 +189,6 @@ def fetch_rule_text_metadata(page, sid):
                         if idx + 1 < len(text_nodes):
                             rule_text_data[key] = clean_value(text_nodes[idx + 1])
 
-        # Extract references and rule_metadata from the code/pre block or general text
         code_el = soup.find("code") or soup.find("pre")
         full_rule_text = code_el.get_text(separator=" ", strip=True) if code_el else soup.get_text(separator=" ", strip=True)
 
@@ -236,88 +210,108 @@ def fetch_rule_text_metadata(page, sid):
                 meta_dict[sub_parts[0]] = True
         if meta_dict:
             rule_text_data["rule_metadata"] = meta_dict
-
         return rule_text_data
     except Exception as e:
-        print(f"    [!] Error parsing RuleText metadata for SID {sid}: {e}")
+        logging.warning(f"    [!] Error parsing RuleText metadata for SID {sid}: {e}")
         return rule_text_data
 
 
 def format_and_split_rule(raw_record):
-    # Converts types and ensures keys are properly normalized
     network_match = raw_record.get("network_match")
-    
-    parsed_header = {
-        "protocol": None,
-        "src_net": None,
-        "src_port": None,
-        "direction": None,
-        "dst_net": None,
-        "dst_port": None
-    }
-
+    parsed_header = {"protocol": None, "src_net": None, "src_port": None,
+                      "direction": None, "dst_net": None, "dst_port": None}
     if network_match:
         header_pattern = re.compile(
-            r"^(?P<protocol>[a-zA-Z0-9_-]+)\s+"
-            r"(?P<src_net>\S+)\s+"
-            r"(?P<src_port>\S+)\s+"
-            r"(?P<direction>->|<->|<>)\s+"
-            r"(?P<dst_net>\S+)\s+"
-            r"(?P<dst_port>\S+)"
+            r"^(?P<protocol>[a-zA-Z0-9_-]+)\s+(?P<src_net>\S+)\s+(?P<src_port>\S+)\s+"
+            r"(?P<direction>->|<->|<>)\s+(?P<dst_net>\S+)\s+(?P<dst_port>\S+)"
         )
         match = header_pattern.match(network_match.strip())
         if match:
             parsed_header.update(match.groupdict())
 
-    # Guarantee SID is mapped correctly using scraped data or falling back securely to map dictionary value
     sid_val = raw_record.get("sid")
     sid = int(sid_val) if sid_val is not None and str(sid_val).isdigit() else None
-
     rev_val = raw_record.get("rev")
     rev = int(rev_val) if rev_val is not None and str(rev_val).isdigit() else None
 
-    formatted_record = {
-        "sid": sid,
-        "rev": rev,
-        "msg": raw_record.get("msg"),
-        "classtype": raw_record.get("classtype"),
-        "action": raw_record.get("action"),
-        "protocol": parsed_header["protocol"],
-        "src_net": parsed_header["src_net"],
-        "src_port": parsed_header["src_port"],
-        "direction": parsed_header["direction"],
-        "dst_net": parsed_header["dst_net"],
-        "dst_port": parsed_header["dst_port"],
-        "ruleset": raw_record.get("ruleset", "et/open"),
-        "vendor": "Proofpoint",
-        "flow": raw_record.get("flow"),
-        "flowbits": raw_record.get("flowbits"),
-        "references": raw_record.get("references", []),
-        "rule_metadata": raw_record.get("rule_metadata"),
-        "et_name": raw_record.get("name"),
-        "creation_date": raw_record.get("creation_date"),
-        "last_modified": raw_record.get("last_modified"),
-        "severity": raw_record.get("severity"),
+    return {
+        "sid": sid, "rev": rev, "msg": raw_record.get("msg"),
+        "classtype": raw_record.get("classtype"), "action": raw_record.get("action"),
+        "protocol": parsed_header["protocol"], "src_net": parsed_header["src_net"],
+        "src_port": parsed_header["src_port"], "direction": parsed_header["direction"],
+        "dst_net": parsed_header["dst_net"], "dst_port": parsed_header["dst_port"],
+        "ruleset": raw_record.get("ruleset", "et/open"), "vendor": "Proofpoint",
+        "flow": raw_record.get("flow"), "flowbits": raw_record.get("flowbits"),
+        "references": raw_record.get("references", []), "rule_metadata": raw_record.get("rule_metadata"),
+        "et_name": raw_record.get("name"), "creation_date": raw_record.get("creation_date"),
+        "last_modified": raw_record.get("last_modified"), "severity": raw_record.get("severity"),
         "affected_products": raw_record.get("affected_products"),
         "signature_placement": raw_record.get("signature_placement"),
-        "attack_target": raw_record.get("attack_target"),
-        "category": raw_record.get("category"),
-        "malware_family": raw_record.get("malware_family"),
-        "performance_impact": raw_record.get("performance_impact"),
+        "attack_target": raw_record.get("attack_target"), "category": raw_record.get("category"),
+        "malware_family": raw_record.get("malware_family"), "performance_impact": raw_record.get("performance_impact"),
         "description": raw_record.get("description")
     }
 
-    return formatted_record
+
+async def scrape_one(context, rule, results, failed_sids, lock, save_progress):
+    """One worker's job for one SID - opens its own page, scrapes, closes it."""
+    sid_str = str(rule["sid"])
+    if sid_str in results and "severity" in results[sid_str] and results[sid_str].get("protocol") is not None:
+        return
+
+    page = await context.new_page()
+    try:
+        url = f"https://threatintel.proofpoint.com/sid/{sid_str}"
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await page.locator("button, [role='tab']").first.wait_for(timeout=4000)
+        except Exception as e:
+            logging.warning(f"Failed to load URL for SID {sid_str}: {e}")
+            async with lock:
+                if sid_str not in failed_sids:
+                    failed_sids.append(sid_str)
+            return
+
+        summary_meta = await fetch_summary_metadata(page, rule["sid"])
+        ruletext_meta = await fetch_rule_text_metadata(page, rule["sid"])
+        desc = await fetch_description(page, rule["sid"])
+
+        raw_scraped_data = {"sid": rule["sid"], "msg": rule["msg"], **summary_meta, **ruletext_meta, "description": desc}
+
+        async with lock:
+            results[sid_str] = format_and_split_rule(raw_scraped_data)
+            if len(results) % 25 == 0:
+                save_progress()
+                logging.info(f"Checkpoint saved - {len(results)} processed, {len(failed_sids)} failed so far")
+
+    except Exception as e:
+        logging.error(f"Unexpected error processing SID {sid_str}: {e}")
+        async with lock:
+            if sid_str not in failed_sids:
+                failed_sids.append(sid_str)
+    finally:
+        await page.close()
+        await asyncio.sleep(REQUEST_DELAY)
 
 
-def main():
+async def worker(name, queue, context, results, failed_sids, lock, save_progress):
+    while True:
+        rule = await queue.get()
+        if rule is None:
+            queue.task_done()
+            break
+        await scrape_one(context, rule, results, failed_sids, lock, save_progress)
+        queue.task_done()
+
+
+async def main():
     all_rules = load_sids_from_map(MAP_FILE)
+    all_rules = all_rules[START_INDEX:END_INDEX]
+    logging.info(f"Processing index range [{START_INDEX}:{END_INDEX}] - {len(all_rules)} rules")
 
     if TEST_LIMIT:
-        logging.info(f"TEST MODE ACTIVE: Limiting processing to first {TEST_LIMIT} rules.")
         all_rules = all_rules[:TEST_LIMIT]
-    else:
-        logging.info(f"FULL RUN MODE ACTIVE: Processing all {len(all_rules)} rules.")
+        logging.info(f"TEST MODE ACTIVE: limiting to first {TEST_LIMIT} rules in this range.")
 
     results = {}
     if os.path.exists(CHECKPOINT_FILE):
@@ -330,13 +324,9 @@ def main():
         with open(FAILED_SIDS_FILE, "r", encoding="utf-8") as f:
             failed_sids = json.load(f)
 
-    total = len(all_rules)
-    processed_count = 0
-    browser = None
+    lock = asyncio.Lock()
 
     def save_progress():
-        """Called from checkpoints AND from the finally block, so progress
-        is never lost regardless of how the run ends."""
         with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
@@ -344,65 +334,30 @@ def main():
         with open(FAILED_SIDS_FILE, "w", encoding="utf-8") as f:
             json.dump(failed_sids, f, indent=2, ensure_ascii=False)
 
-    logging.info("Launching headless browser...")
+    browser = None
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 720}
             )
-            page = context.new_page()
 
-            for idx, rule in enumerate(all_rules, start=1):
-                sid_str = str(rule["sid"])
+            queue = asyncio.Queue()
+            for rule in all_rules:
+                queue.put_nowait(rule)
+            for _ in range(CONCURRENCY):
+                queue.put_nowait(None)  # sentinel to stop each worker
 
-                if sid_str in results and "severity" in results[sid_str] and results[sid_str].get("protocol") is not None:
-                    continue
+            workers = [
+                asyncio.create_task(worker(f"w{i}", queue, context, results, failed_sids, lock, save_progress))
+                for i in range(CONCURRENCY)
+            ]
+            await queue.join()
+            for w in workers:
+                w.cancel()
 
-                logging.info(f"[{idx}/{total}] Fetching SID {sid_str} metadata and description...")
-
-                url = f"https://threatintel.proofpoint.com/sid/{sid_str}"
-                try:
-                    page.goto(url, wait_until="networkidle", timeout=20000)
-                    page.locator("button, [role='tab']").first.wait_for(timeout=5000)
-                except Exception as e:
-                    logging.warning(f"Failed to load URL for SID {sid_str}: {e}")
-                    if sid_str not in failed_sids:
-                        failed_sids.append(sid_str)
-                    continue
-
-                try:
-                    summary_meta = fetch_summary_metadata(page, rule["sid"])
-                    ruletext_meta = fetch_rule_text_metadata(page, rule["sid"])
-                    desc = fetch_description(page, rule["sid"])
-
-                    raw_scraped_data = {
-                        "sid": rule["sid"],
-                        "msg": rule["msg"],
-                        **summary_meta,
-                        **ruletext_meta,
-                        "description": desc
-                    }
-
-                    results[sid_str] = format_and_split_rule(raw_scraped_data)
-                    processed_count += 1
-
-                except Exception as e:
-                    # Catches anything unexpected in the per-SID processing itself
-                    # (not just page-load failures) so one bad record can't kill the run.
-                    logging.error(f"Unexpected error processing SID {sid_str}: {e}")
-                    if sid_str not in failed_sids:
-                        failed_sids.append(sid_str)
-                    continue
-
-                if processed_count % 25 == 0:
-                    save_progress()
-                    logging.info(f"Saved checkpoint + updated {OUTPUT_FILE} ({len(results)} processed, {len(failed_sids)} failed so far)")
-
-                time.sleep(REQUEST_DELAY)
-
-            browser.close()
+            await browser.close()
             browser = None
 
     except KeyboardInterrupt:
@@ -410,16 +365,14 @@ def main():
     except Exception as e:
         logging.critical(f"Scraping stopped due to an unexpected error: {e}", exc_info=True)
     finally:
-        # Runs no matter how the run ends - success, crash, or manual interrupt -
-        # so you never lose more than a few seconds of work.
         if browser:
             try:
-                browser.close()
+                await browser.close()
             except Exception:
                 pass
         save_progress()
-        logging.info(f"Final save complete. {len(results)} total records, {len(failed_sids)} failed SIDs logged to {FAILED_SIDS_FILE}.")
+        logging.info(f"Final save complete. {len(results)} total records, {len(failed_sids)} failed SIDs logged.")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
