@@ -4,7 +4,7 @@ import json
 import re
 import logging
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PlaywrightError
 
 # --- Configuration ---
 MAP_FILE = "sid-msg.map"
@@ -13,15 +13,13 @@ CHECKPOINT_FILE = "et_checkpoint.json"
 LOG_FILE = "scraping_log.txt"
 FAILED_SIDS_FILE = "failed_sids.json"
 
-# This machine handles SIDs from START_INDEX up to (not including) END_INDEX,
-# based on position in sid-msg.map - NOT based on SID number itself. This is
-# what keeps local and Kaggle from ever double-processing the same range.
 START_INDEX = 0
-END_INDEX = 35000  # local stops here; Kaggle picks up from 35000 onward
+END_INDEX = 35000
 
-TEST_LIMIT = None  # set to a small number to smoke-test, None for full range
-REQUEST_DELAY = 0.3  # per-worker delay - lower now that we run several workers in parallel
-CONCURRENCY = 6  # number of pages scraping simultaneously - start here, raise cautiously
+TEST_LIMIT = None
+REQUEST_DELAY = 0.3
+CONCURRENCY = 6
+HARD_PAGE_TIMEOUT = 25.0  # Hard timeout (seconds) per SID task
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -29,14 +27,21 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     encoding="utf-8"
 )
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-logging.getLogger().addHandler(console)
+
+def log_and_print(msg, level="info"):
+    """Print instantly to console and write to log file."""
+    print(msg, flush=True)
+    if level == "warning":
+        logging.warning(msg)
+    elif level == "error":
+        logging.error(msg)
+    else:
+        logging.info(msg)
 
 
 def load_sids_from_map(file_path):
     sids = []
-    print(f"[+] Loading SIDs from {file_path}...")
+    log_and_print(f"[+] Loading SIDs from {file_path}...")
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Could not find {file_path}. Place it in the script directory.")
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -52,7 +57,7 @@ def load_sids_from_map(file_path):
                     sids.append({"sid": sid, "msg": msg})
                 except ValueError:
                     continue
-    print(f"[+] Found {len(sids)} total rules in {file_path}.")
+    log_and_print(f"[+] Found {len(sids)} total rules in {file_path}.")
     return sids
 
 
@@ -67,10 +72,10 @@ async def fetch_description(page, sid):
         try:
             desc_tab = page.locator("button, [role='tab']", has_text="Description").first
             if await desc_tab.is_visible():
-                await desc_tab.click(timeout=4000)
+                await desc_tab.click(timeout=3000)
                 await page.locator(
                     "text=Description augmented by Proofpoint Nexus, text=Threat Research Generated, text=No Description Available"
-                ).first.wait_for(timeout=3000)
+                ).first.wait_for(timeout=2500)
         except Exception:
             pass
 
@@ -102,7 +107,7 @@ async def fetch_description(page, sid):
                 return text
         return None
     except Exception as e:
-        logging.warning(f"    [!] Could not find description for SID {sid}: {e}")
+        log_and_print(f"    [!] Error fetching description for SID {sid}: {e}", "warning")
         return None
 
 
@@ -112,8 +117,8 @@ async def fetch_summary_metadata(page, sid):
         try:
             summary_tab = page.locator("button, [role='tab']", has_text="Summary").first
             if await summary_tab.is_visible():
-                await summary_tab.click(timeout=4000)
-                await page.locator("text=Creation Date").first.wait_for(timeout=3000)
+                await summary_tab.click(timeout=3000)
+                await page.locator("text=Creation Date").first.wait_for(timeout=2500)
         except Exception:
             pass
 
@@ -149,7 +154,7 @@ async def fetch_summary_metadata(page, sid):
                                 summary_data[field_key] = clean_value(field_val)
         return summary_data
     except Exception as e:
-        logging.warning(f"    [!] Error parsing summary metadata for SID {sid}: {e}")
+        log_and_print(f"    [!] Error parsing summary metadata for SID {sid}: {e}", "warning")
         return {}
 
 
@@ -159,8 +164,8 @@ async def fetch_rule_text_metadata(page, sid):
         try:
             ruletext_tab = page.locator("button, [role='tab']", has_text="RuleText").first
             if await ruletext_tab.is_visible():
-                await ruletext_tab.click(timeout=4000)
-                await page.locator("text=Network Match").first.wait_for(timeout=3000)
+                await ruletext_tab.click(timeout=3000)
+                await page.locator("text=Network Match").first.wait_for(timeout=2500)
         except Exception:
             pass
 
@@ -212,7 +217,7 @@ async def fetch_rule_text_metadata(page, sid):
             rule_text_data["rule_metadata"] = meta_dict
         return rule_text_data
     except Exception as e:
-        logging.warning(f"    [!] Error parsing RuleText metadata for SID {sid}: {e}")
+        log_and_print(f"    [!] Error parsing RuleText metadata for SID {sid}: {e}", "warning")
         return rule_text_data
 
 
@@ -253,25 +258,31 @@ def format_and_split_rule(raw_record):
     }
 
 
-async def scrape_one(context, rule, results, failed_sids, lock, save_progress):
-    """One worker's job for one SID - opens its own page, scrapes, closes it."""
+async def scrape_one(context, rule, results, failed_sids, lock, save_progress, worker_name):
     sid_str = str(rule["sid"])
-    if sid_str in results and "severity" in results[sid_str] and results[sid_str].get("protocol") is not None:
+    
+    # Fast exit if already present in checkpoint
+    if sid_str in results and results[sid_str] is not None:
         return
 
-    page = await context.new_page()
+    log_and_print(f"[{worker_name}] Starting SID {sid_str}...")
+    page = None
     try:
+        page = await context.new_page()
         url = f"https://threatintel.proofpoint.com/sid/{sid_str}"
+        
+        log_and_print(f"[{worker_name}] Navigating to {url}")
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            await page.locator("button, [role='tab']").first.wait_for(timeout=4000)
-        except Exception as e:
-            logging.warning(f"Failed to load URL for SID {sid_str}: {e}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+            await page.locator("button, [role='tab']").first.wait_for(timeout=3000)
+        except Exception as net_err:
+            log_and_print(f"[{worker_name}] [!] Network/Navigation Error on SID {sid_str}: {net_err}", "warning")
             async with lock:
                 if sid_str not in failed_sids:
                     failed_sids.append(sid_str)
             return
 
+        log_and_print(f"[{worker_name}] Parsing metadata for SID {sid_str}...")
         summary_meta = await fetch_summary_metadata(page, rule["sid"])
         ruletext_meta = await fetch_rule_text_metadata(page, rule["sid"])
         desc = await fetch_description(page, rule["sid"])
@@ -280,17 +291,25 @@ async def scrape_one(context, rule, results, failed_sids, lock, save_progress):
 
         async with lock:
             results[sid_str] = format_and_split_rule(raw_scraped_data)
-            if len(results) % 25 == 0:
-                save_progress()
-                logging.info(f"Checkpoint saved - {len(results)} processed, {len(failed_sids)} failed so far")
+            count = len(results)
+            log_and_print(f"[{worker_name}] Successfully scraped SID {sid_str} (Total: {count})")
+            if count % 25 == 0:
+                await asyncio.to_thread(save_progress)
+                log_and_print("\n" + "="*60)
+                log_and_print(f"[>>> CHECKPOINT <<<] Saved {count} processed rules, {len(failed_sids)} failed so far.")
+                log_and_print("="*60 + "\n")
 
     except Exception as e:
-        logging.error(f"Unexpected error processing SID {sid_str}: {e}")
+        log_and_print(f"[{worker_name}] [!] Unexpected error on SID {sid_str}: {e}", "error")
         async with lock:
             if sid_str not in failed_sids:
                 failed_sids.append(sid_str)
     finally:
-        await page.close()
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
         await asyncio.sleep(REQUEST_DELAY)
 
 
@@ -300,24 +319,39 @@ async def worker(name, queue, context, results, failed_sids, lock, save_progress
         if rule is None:
             queue.task_done()
             break
-        await scrape_one(context, rule, results, failed_sids, lock, save_progress)
-        queue.task_done()
+        
+        # Enforce hard task wrapper timeout to kill hangs caused by DNS/Socket stalls
+        try:
+            await asyncio.wait_for(
+                scrape_one(context, rule, results, failed_sids, lock, save_progress, name),
+                timeout=HARD_PAGE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            log_and_print(f"[{name}] [!] HARD TIMEOUT (>{HARD_PAGE_TIMEOUT}s) reached on SID {rule['sid']}. Force cancelling.", "error")
+            async with lock:
+                sid_str = str(rule["sid"])
+                if sid_str not in failed_sids:
+                    failed_sids.append(sid_str)
+        except Exception as e:
+            log_and_print(f"[{name}] [!] Worker execution error on SID {rule['sid']}: {e}", "error")
+        finally:
+            queue.task_done()
 
 
 async def main():
     all_rules = load_sids_from_map(MAP_FILE)
     all_rules = all_rules[START_INDEX:END_INDEX]
-    logging.info(f"Processing index range [{START_INDEX}:{END_INDEX}] - {len(all_rules)} rules")
+    log_and_print(f"Processing index range [{START_INDEX}:{END_INDEX}] - {len(all_rules)} rules")
 
     if TEST_LIMIT:
         all_rules = all_rules[:TEST_LIMIT]
-        logging.info(f"TEST MODE ACTIVE: limiting to first {TEST_LIMIT} rules in this range.")
+        log_and_print(f"TEST MODE ACTIVE: limiting to first {TEST_LIMIT} rules in this range.")
 
     results = {}
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
             results = json.load(f)
-        logging.info(f"Resuming from checkpoint: {len(results)} rules already processed.")
+        log_and_print(f"Resuming from checkpoint: {len(results)} rules already processed.")
 
     failed_sids = []
     if os.path.exists(FAILED_SIDS_FILE):
@@ -327,16 +361,28 @@ async def main():
     lock = asyncio.Lock()
 
     def save_progress():
-        with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(results.values()), f, indent=2, ensure_ascii=False)
-        with open(FAILED_SIDS_FILE, "w", encoding="utf-8") as f:
-            json.dump(failed_sids, f, indent=2, ensure_ascii=False)
+        """Saves progress atomically and compactly without blocking JSON indentations."""
+        tmp_checkpoint = CHECKPOINT_FILE + ".tmp"
+        tmp_output = OUTPUT_FILE + ".tmp"
+        tmp_failed = FAILED_SIDS_FILE + ".tmp"
+
+        # Fast compact dumps (no indent=2) to minimize CPU load
+        with open(tmp_checkpoint, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False)
+        with open(tmp_output, "w", encoding="utf-8") as f:
+            json.dump(list(results.values()), f, ensure_ascii=False)
+        with open(tmp_failed, "w", encoding="utf-8") as f:
+            json.dump(failed_sids, f, ensure_ascii=False)
+
+        # Atomic overwrite: prevents corruption if Ctrl+C happens mid-save
+        os.replace(tmp_checkpoint, CHECKPOINT_FILE)
+        os.replace(tmp_output, OUTPUT_FILE)
+        os.replace(tmp_failed, FAILED_SIDS_FILE)
 
     browser = None
     try:
         async with async_playwright() as p:
+            log_and_print("[+] Launching Chromium Browser...")
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -347,8 +393,9 @@ async def main():
             for rule in all_rules:
                 queue.put_nowait(rule)
             for _ in range(CONCURRENCY):
-                queue.put_nowait(None)  # sentinel to stop each worker
+                queue.put_nowait(None)
 
+            log_and_print(f"[+] Starting {CONCURRENCY} workers...")
             workers = [
                 asyncio.create_task(worker(f"w{i}", queue, context, results, failed_sids, lock, save_progress))
                 for i in range(CONCURRENCY)
@@ -361,9 +408,9 @@ async def main():
             browser = None
 
     except KeyboardInterrupt:
-        logging.warning("Scraping interrupted by user (Ctrl+C). Saving progress before exit...")
+        log_and_print("Scraping interrupted by user (Ctrl+C). Saving progress before exit...", "warning")
     except Exception as e:
-        logging.critical(f"Scraping stopped due to an unexpected error: {e}", exc_info=True)
+        log_and_print(f"Scraping stopped due to an unexpected error: {e}", "error")
     finally:
         if browser:
             try:
@@ -371,7 +418,7 @@ async def main():
             except Exception:
                 pass
         save_progress()
-        logging.info(f"Final save complete. {len(results)} total records, {len(failed_sids)} failed SIDs logged.")
+        log_and_print(f"Final save complete. {len(results)} total records, {len(failed_sids)} failed SIDs logged.")
 
 
 if __name__ == "__main__":
