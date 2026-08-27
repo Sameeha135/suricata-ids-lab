@@ -1,2 +1,4 @@
-# Ignore large generated JSON rule files
+# Generated rule data
 *.json
+__pycache__/
+*.map
